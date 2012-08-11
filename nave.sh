@@ -31,6 +31,19 @@ fi
 # Use fancy pants globs
 shopt -s extglob
 
+# Try to figure out the os and arch for binary fetching
+uname="$(uname -a)"
+os=
+arch=x86
+case "$uname" in
+  Linux\ *) os=linux ;;
+  Darwin\ *) os=darwin ;;
+  SunOS\ *) os=sunos ;;
+esac
+case "$uname" in
+  *x86_64*) arch=x64 ;;
+esac
+
 tar=${TAR-tar}
 
 NAVE_CURL_OPTS="-#Lf"
@@ -136,7 +149,14 @@ RC
       cmd="nave_help"
       ;;
   esac
-  $cmd "$@" && exit 0 || fail "failed somehow"
+  $cmd "$@"
+  local ret=$?
+  if [ $ret -eq 0 ]; then
+    exit 0
+  else
+    echo "failed with code=$ret" >&2
+    exit $ret
+  fi
 }
 
 function enquote_all () {
@@ -197,13 +217,54 @@ nave_fetch () {
     fi
   done
 
+  rm "$src".tgz
   remove_dir "$src"
-  fail "Couldn't fetch $version"
+  echo "Couldn't fetch $version" >&2
+  return 1
 }
 
 build () {
   local version="$1"
+
+  # shortcut - try the binary if possible.
+  if [ -n "$os" ]; then
+    local binavail
+    # binaries started with node 0.8.6
+    case "$version" in
+      0.8.[012345]) binavail=0 ;;
+      0.[1234567]) binavail=0 ;;
+      *) binavail=1 ;;
+    esac
+    if [ $binavail -eq 1 ]; then
+      local t="$version-$os-$arch"
+      local url="http://nodejs.org/dist/v$version/node-v${t}.tar.gz"
+      local tgz="$NAVE_SRC/$t.tgz"
+      curl -#Lf "$url" > "$tgz"
+      if [ $? -ne 0 ]; then
+        # binary download failed.  oh well.  cleanup, and proceed.
+        rm "$tgz"
+        echo "Binary download failed, trying source." >&2
+      else
+        # unpack straight into the build target.
+        $tar xzf "$tgz" -C "$2" --strip-components 1
+        if [ $? -ne 0 ]; then
+          rm "$tgz"
+          nave_uninstall "$version"
+          echo "Binary unpack failed, trying source." >&2
+        fi
+        # it worked!
+        echo "installed from binary" >&2
+        return 0
+      fi
+    fi
+  fi
+
   nave_fetch "$version"
+  if [ $? != 0 ]; then
+    # fetch failed, don't continue and try to build it.
+    return 1
+  fi
+
   local src="$NAVE_SRC/$version"
   local jobs=$NAVE_JOBS
   jobs=${jobs:-$JOBS}
@@ -212,8 +273,8 @@ build () {
 
   ( cd -- "$src"
     [ -f ~/.naverc ] && . ~/.naverc || true
-    if [ "$NAVE_CONFIG" == "--debug" ]; then
-      NAVE_CONFIG=("--debug")
+    if [ "$NAVE_CONFIG" == "" ]; then
+      NAVE_CONFIG=()
     fi
     JOBS=$jobs ./configure "${NAVE_CONFIG[@]}" --prefix="$2" \
       || fail "Failed to configure $version"
@@ -221,6 +282,7 @@ build () {
       || fail "Failed to make $version"
     make install || fail "Failed to install $version"
   ) || fail "fail"
+  return $?
 }
 
 nave_usemain () {
@@ -253,10 +315,14 @@ nave_install () {
     return 0
   fi
   local install="$NAVE_ROOT/$version"
-  remove_dir "$install"
   ensure_dir "$install"
 
   build "$version" "$install"
+  local ret=$?
+  if [ $ret -ne 0 ]; then
+    remove_dir "$install"
+    return $ret
+  fi
 }
 
 nave_test () {
@@ -266,9 +332,9 @@ nave_test () {
   ( cd -- "$src"
     [ -f ~/.naverc ] && . ~/.naverc || true
     if [ "$NAVE_CONFIG" == "" ]; then
-      NAVE_CONFIG=("--debug")
+      NAVE_CONFIG=()
     fi
-    ./configure "${NAVE_CONFIG[@]}" || fail "failed to ./configure --debug"
+    ./configure "${NAVE_CONFIG[@]}" || fail "failed to ./configure"
     make test-all || fail "Failed tests"
   ) || fail "failed"
 }
@@ -298,7 +364,7 @@ nave_ls_named () {
 
 nave_ls_all () {
   nave_ls \
-    && nave_ls_remote \
+    && (echo ""; nave_ls_remote) \
     || return 1
 }
 
@@ -371,12 +437,12 @@ organize_version_list () {
 
 nave_has () {
   local version=$(ver "$1")
-  [ -d "$NAVE_SRC/$version/configure" ] || return 1
+  [ -x "$NAVE_SRC/$version/configure" ] || return 1
 }
 
 nave_installed () {
   local version=$(ver "$1")
-  [ -d "$NAVE_ROOT/$version/bin" ] || return 1
+  [ -x "$NAVE_ROOT/$version/bin/node" ] || return 1
 }
 
 nave_use () {
@@ -533,7 +599,7 @@ add_named_env () {
 }
 
 nave_clean () {
-  remove_dir "$NAVE_SRC/$(ver "$1")"
+  rm -rf "$NAVE_SRC/$(ver "$1")" "$NAVE_SRC/$(ver "$1")".tgz
 }
 
 nave_uninstall () {
